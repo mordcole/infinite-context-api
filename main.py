@@ -1,3 +1,7 @@
+import json
+import time
+import urllib.request
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -30,6 +34,16 @@ class IngestNotesRequest(BaseModel):
 
 
 class IngestNotesResponse(BaseModel):
+    ingested: int
+    chunks: int
+
+
+class IngestGitHubRequest(BaseModel):
+    pat: str
+    repo: str  # "owner/reponame"
+
+
+class IngestGitHubResponse(BaseModel):
     ingested: int
     chunks: int
 
@@ -81,6 +95,82 @@ def ingest_notes(request: IngestNotesRequest):
             upsert_chunks(chunks)
 
         return IngestNotesResponse(ingested=len(request.files), chunks=len(chunks))
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ingest/github", response_model=IngestGitHubResponse)
+def ingest_github(request: IngestGitHubRequest):
+    try:
+        owner, reponame = request.repo.split("/", 1)
+        gh_headers = {
+            "Authorization": f"token {request.pat}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "infinite-context-rag",
+        }
+
+        # Fetch all commits with pagination
+        all_commits = []
+        page = 1
+        while True:
+            url = f"https://api.github.com/repos/{request.repo}/commits?per_page=100&page={page}"
+            req = urllib.request.Request(url, headers=gh_headers)
+            with urllib.request.urlopen(req) as resp:
+                page_data = json.loads(resp.read())
+            if not page_data:
+                break
+            all_commits.extend(page_data)
+            if len(page_data) < 100:
+                break
+            page += 1
+            time.sleep(0.5)
+
+        # For each commit, fetch full detail and build chunks
+        chunks = []
+        filename_prefix = f"{owner}_{reponame}"
+
+        for commit in all_commits:
+            sha = commit["sha"]
+            url = f"https://api.github.com/repos/{request.repo}/commits/{sha}"
+            req = urllib.request.Request(url, headers=gh_headers)
+            with urllib.request.urlopen(req) as resp:
+                detail = json.loads(resp.read())
+
+            message = detail["commit"]["message"]
+            author = detail["commit"]["author"]["name"]
+            date = detail["commit"]["author"]["date"]
+            files = detail.get("files", [])
+
+            parts = [f"commit: {sha[:8]}\nmessage: {message}\nauthor: {author}\ndate: {date}"]
+            for f in files:
+                patch = f.get("patch", "")
+                if patch:
+                    parts.append(f"{f['filename']}:\n{patch}")
+
+            text = clean_text("\n---\n".join(parts))
+            if not text:
+                time.sleep(0.1)
+                continue
+
+            splits = split_text(text) if len(text) > 6000 else [text]
+            filename = f"{filename_prefix}_{sha}"
+            for i, split in enumerate(splits):
+                chunks.append({
+                    "text": split,
+                    "source": "github",
+                    "date": date,
+                    "doc_id": hash_text(split),
+                    "filename": f"{filename}::chunk{i}",
+                })
+
+            time.sleep(0.1)  # rate limit buffer
+
+        if chunks:
+            chunks = generate_embeddings(chunks)
+            upsert_chunks(chunks)
+
+        return IngestGitHubResponse(ingested=len(all_commits), chunks=len(chunks))
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
